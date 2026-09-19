@@ -53,7 +53,7 @@ if st.button(f"🚀 啟動 {ticker} 即時訓練與預測", type="primary"):
                 st.error(f"❌ {ticker} 上市時間過短，歷史資料不足 (需至少 300 天)，無法進行機器學習訓練！")
                 st.stop()
                 
-            # [B] 🔥 抓取新聞情緒 (Gemini LLM 升級版 + SnowNLP 備用機制) 🔥
+            # [B] 🔥 抓取新聞情緒 (Gemini LLM 智慧尋星版 + SnowNLP 備用機制) 🔥
             url = f"https://news.google.com/rss/search?q={keyword}+when:3d&hl=zh-TW&gl=TW&ceid=TW:zh-Hant"
             feed = feedparser.parse(url)
             
@@ -67,17 +67,27 @@ if st.button(f"🚀 啟動 {ticker} 即時訓練與預測", type="primary"):
                     import google.generativeai as genai
                     api_key = st.secrets["GEMINI_API_KEY"]
                     genai.configure(api_key=api_key)
-                    model = genai.GenerativeModel('gemini-pro')
+                    
+                    # 自動尋找你的帳號支援的可用模型 (不寫死名稱，完美避開 404 錯誤)
+                    valid_model_name = 'gemini-1.5-flash'  # 預設
+                    for m in genai.list_models():
+                        if 'generateContent' in m.supported_generation_methods:
+                            valid_model_name = m.name
+                            break  # 找到第一個支援文字生成的模型就直接採用
+                            
+                    model = genai.GenerativeModel(valid_model_name)
                     
                     prompt = f"你是一個專業的台灣股市分析師。請綜合分析以下新聞標題對該公司股價的情緒影響。請只回傳 0.0 到 1.0 之間的浮點數數字（0.0為極度看跌，1.0為極度看漲，0.5為中立），不要任何解釋。新聞標題：{news_titles}"
                     
                     response = model.generate_content(prompt)
                     avg_sentiment = float(response.text.strip())
-                    st.toast("✨ 成功使用 Gemini 進行新聞情緒分析！", icon="🧠")
+                    
+                    # 印出成功抓到的模型名稱
+                    st.toast(f"✨ 成功使用 {valid_model_name} 進行新聞情緒分析！", icon="🧠")
                     
                 except Exception as e:
                     # 萬一 API 沒設定好或失效，無縫切換回 SnowNLP 備用
-                    st.toast(f"⚠️ Gemini 失敗，錯誤原因：{e}", icon="🔄")
+                    st.toast(f"⚠️ Gemini 失敗，已自動切換回 SnowNLP。錯誤原因：{e}", icon="🔄")
                     sentiment_scores = []
                     for title in news_titles:
                         try:
