@@ -67,7 +67,7 @@ if st.button(f"🚀 啟動 {ticker} 即時訓練與預測", type="primary"):
                     import google.generativeai as genai
                     api_key = st.secrets["GEMINI_API_KEY"]
                     genai.configure(api_key=api_key)
-                    model = genai.GenerativeModel('gemini-1.5-flash')
+                    model = genai.GenerativeModel('gemini-pro')
                     
                     prompt = f"你是一個專業的台灣股市分析師。請綜合分析以下新聞標題對該公司股價的情緒影響。請只回傳 0.0 到 1.0 之間的浮點數數字（0.0為極度看跌，1.0為極度看漲，0.5為中立），不要任何解釋。新聞標題：{news_titles}"
                     
