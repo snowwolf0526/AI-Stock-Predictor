@@ -77,7 +77,7 @@ if st.button(f"🚀 啟動 {ticker} 即時訓練與預測", type="primary"):
                     
                 except Exception as e:
                     # 萬一 API 沒設定好或失效，無縫切換回 SnowNLP 備用
-                    st.toast("⚠️ Gemini API 呼叫失敗，已自動切換回 SnowNLP 備用模組。", icon="🔄")
+                    st.toast(f"⚠️ Gemini 失敗，錯誤原因：{e}", icon="🔄")
                     sentiment_scores = []
                     for title in news_titles:
                         try:
