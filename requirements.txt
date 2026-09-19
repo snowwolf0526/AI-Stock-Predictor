@@ -1,0 +1,8 @@
+streamlit==1.32.0
+yfinance==0.2.37
+pandas==2.2.1
+pandas-ta==0.3.14b0
+xgboost==2.0.3
+feedparser==6.0.11
+snownlp==0.12.3
+plotly==5.20.0
