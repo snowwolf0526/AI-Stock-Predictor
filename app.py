@@ -8,16 +8,81 @@ from snownlp import SnowNLP
 from datetime import datetime, timedelta
 import plotly.graph_objects as go
 import warnings
+import json
+import re
 
 warnings.filterwarnings('ignore')
 
 st.set_page_config(page_title="AI 股市預測系統", layout="wide")
 
+# ==========================================
+# ⚡ 系統效能優化區：導入快取機制 (Caching)
+# ==========================================
+@st.cache_data(ttl=3600)
+def fetch_stock_data(ticker):
+    """抓取歷史股價並快取 1 小時，避免重複呼叫 API"""
+    end_date = datetime.now()
+    start_date = end_date - timedelta(days=730)
+    stock = yf.download(ticker, start=start_date.strftime("%Y-%m-%d"), end=end_date.strftime("%Y-%m-%d"), progress=False)
+    return stock
+
+@st.cache_data(ttl=3600)
+def fetch_news_sentiment(keyword):
+    """抓取新聞情緒並快取 1 小時，包含 JSON 結構化解析"""
+    url = f"https://news.google.com/rss/search?q={keyword}+when:3d&hl=zh-TW&gl=TW&ceid=TW:zh-Hant"
+    feed = feedparser.parse(url)
+    news_titles = [entry.title for entry in feed.entries[:5]]
+    
+    avg_sentiment = 0.5
+    ai_reason = "近期無相關財經新聞，模型以中立情緒計算。"
+    
+    if news_titles:
+        try:
+            import google.generativeai as genai
+            api_key = st.secrets["GEMINI_API_KEY"]
+            genai.configure(api_key=api_key)
+            
+            valid_model_name = 'gemini-3.6-flash'
+            model = genai.GenerativeModel(valid_model_name)
+            
+            # 強制要求回傳 JSON 格式
+            prompt = f"""你是一個專業的台灣股市分析師。請綜合分析以下新聞標題對該公司股價的情緒影響。
+            請務必只回傳一個標準的 JSON 格式字串，不要包含任何其他解釋文字或 Markdown 標籤。
+            格式範例：{{"score": 0.8, "reason": "因為營收創新高且外資調升評等，市場情緒樂觀。"}}
+            score 必須是 0.0 到 1.0 的浮點數（0.0為極度看跌，1.0為極度看漲，0.5為中立）。
+            新聞標題：{news_titles}"""
+            
+            response = model.generate_content(prompt)
+            raw_text = response.text.strip()
+            
+            # 清理 Markdown 標籤
+            if raw_text.startswith("```"):
+                raw_text = re.sub(r"^```(json)?|```$", "", raw_text, flags=re.MULTILINE).strip()
+                
+            result = json.loads(raw_text)
+            avg_sentiment = float(result.get("score", 0.5))
+            ai_reason = result.get("reason", "AI 判定為中立或無特別理由。")
+            
+        except Exception as e:
+            ai_reason = f"⚠️ API 呼叫失敗，已切換回 SnowNLP 備用模組計算。錯誤細節：{e}"
+            sentiment_scores = []
+            for title in news_titles:
+                try:
+                    sentiment_scores.append(SnowNLP(title).sentiments)
+                except:
+                    pass
+            if sentiment_scores:
+                avg_sentiment = sum(sentiment_scores) / len(sentiment_scores)
+                
+    return avg_sentiment, ai_reason
+
+# ==========================================
+# 🖥️ 主程式與 UI 顯示區
+# ==========================================
 st.title("📈 畢業專題：AI 股市預測系統 (即時動態訓練版)")
-st.markdown("本系統採用 **On-the-fly 即時訓練架構**，輸入任意台股代號後，系統將當場抓取歷史資料、建立專屬 XGBoost 模型並進行預測，完美解決不同股價量級的誤差問題。")
+st.markdown("本系統採用 **On-the-fly 即時訓練架構**，結合 LLM 新聞情緒分析與歷史回測模組，並導入 **快取機制 (Caching)** 大幅提升查詢效能。")
 st.warning("⚠️ 免責聲明：本系統僅供學術專題展示使用，不構成任何投資建議。")
 
-# === 1. 使用者輸入區 ===
 st.markdown("### 🎯 請輸入預測標的")
 col1, col2 = st.columns([1, 3])
 with col1:
@@ -31,14 +96,11 @@ if clean_ticker.endswith(".TW") or clean_ticker.endswith(".TWO"):
 else:
     ticker = f"{clean_ticker}.TW"
 
-# === 2. 核心運算區 (即時訓練與預測) ===
 if st.button(f"🚀 啟動 {ticker} 即時訓練與預測", type="primary"):
-    with st.spinner(f'正在抓取 {ticker} 過去兩年資料並訓練專屬模型中，請稍候約 5-8 秒...'):
+    with st.spinner(f'正在進行運算中，若為首次查詢需時 5-8 秒，再次查詢將啟動 0.1 秒極速快取...'):
         try:
-            # [A] 抓取歷史股價 (2年)
-            end_date = datetime.now()
-            start_date = end_date - timedelta(days=730)
-            stock = yf.download(ticker, start=start_date.strftime("%Y-%m-%d"), end=end_date.strftime("%Y-%m-%d"), progress=False)
+            # 呼叫快取函數抓資料
+            stock = fetch_stock_data(ticker)
             
             if stock.empty:
                 st.error("❌ 找不到該股票資料，請確認代號是否正確。")
@@ -53,54 +115,17 @@ if st.button(f"🚀 啟動 {ticker} 即時訓練與預測", type="primary"):
                 st.error(f"❌ {ticker} 上市時間過短，歷史資料不足 (需至少 300 天)，無法進行機器學習訓練！")
                 st.stop()
                 
-            # [B] 🔥 抓取新聞情緒 (Gemini LLM 官方指定版 + SnowNLP 備用機制) 🔥
-            url = f"https://news.google.com/rss/search?q={keyword}+when:3d&hl=zh-TW&gl=TW&ceid=TW:zh-Hant"
-            feed = feedparser.parse(url)
-            
-            # 萃取前 5 則最新新聞標題
-            news_titles = [entry.title for entry in feed.entries[:5]]
-            avg_sentiment = 0.5  # 預設中立
-            
-            if news_titles:
-                try:
-                    # 優先嘗試使用 Gemini API 進行高階情緒分析
-                    import google.generativeai as genai
-                    api_key = st.secrets["GEMINI_API_KEY"]
-                    genai.configure(api_key=api_key)
-                    
-                    # 聽從 Google 伺服器的建議，直接指定最新版模型
-                    valid_model_name = 'gemini-3.6-flash'
-                    model = genai.GenerativeModel(valid_model_name)
-                    
-                    prompt = f"你是一個專業的台灣股市分析師。請綜合分析以下新聞標題對該公司股價的情緒影響。請只回傳 0.0 到 1.0 之間的浮點數數字（0.0為極度看跌，1.0為極度看漲，0.5為中立），不要任何解釋。新聞標題：{news_titles}"
-                    
-                    response = model.generate_content(prompt)
-                    avg_sentiment = float(response.text.strip())
-                    
-                    # 印出成功抓到的模型名稱
-                    st.toast(f"✨ 成功使用 {valid_model_name} 進行新聞情緒分析！", icon="🧠")
-                    
-                except Exception as e:
-                    # 萬一 API 沒設定好或失效，無縫切換回 SnowNLP 備用
-                    st.toast(f"⚠️ Gemini 失敗，已自動切換回 SnowNLP。錯誤原因：{e}", icon="🔄")
-                    sentiment_scores = []
-                    for title in news_titles:
-                        try:
-                            sentiment_scores.append(SnowNLP(title).sentiments)
-                        except:
-                            pass
-                    if sentiment_scores:
-                        avg_sentiment = sum(sentiment_scores) / len(sentiment_scores)
-            
+            # 呼叫快取函數抓新聞情緒與 AI 解析
+            avg_sentiment, ai_reason = fetch_news_sentiment(keyword)
             df['Sentiment'] = avg_sentiment  
             
-            # [C] 計算技術指標
+            # 計算技術指標
             df.ta.sma(length=5, append=True)
             df.ta.sma(length=10, append=True)
             df.ta.rsi(length=14, append=True)
             df.ta.macd(append=True)
             
-            # [D] 定義預測目標 (Y) 與特徵 (X)
+            # 定義預測目標 (Y) 與特徵 (X)
             df['Next_Close'] = df['Close'].shift(-1)
             df['Target'] = (df['Next_Close'] > df['Close']).astype(int)
             
@@ -112,17 +137,17 @@ if st.button(f"🚀 啟動 {ticker} 即時訓練與預測", type="primary"):
             latest_data = df.iloc[-1:]
             X_today = latest_data[features]
             
-            # [E] 即時動態訓練 (On-the-fly)
+            # 即時動態訓練 (On-the-fly)
             model_xgb = XGBClassifier(n_estimators=100, learning_rate=0.05, max_depth=4, random_state=42)
             model_xgb.fit(train_df[features], train_df['Target'])
             
-            # [F] 進行預測
+            # 進行預測
             prediction = model_xgb.predict(X_today)[0]
             probability = model_xgb.predict_proba(X_today)[0]
             
             st.success(f"✅ 專屬模型訓練完成！共使用 {len(train_df)} 筆歷史資料進行現場訓練。")
             
-            # === 3. 畫面顯示區 ===
+            # --- 畫面顯示區 ---
             st.markdown("### 🔮 明日趨勢預測結果")
             col1, col2 = st.columns(2)
             with col1:
@@ -133,6 +158,10 @@ if st.button(f"🚀 啟動 {ticker} 即時訓練與預測", type="primary"):
             with col2:
                 confidence = probability[prediction] * 100
                 st.metric(label="模型信心水準", value=f"{confidence:.1f}%")
+            
+            # 🤖 新增 AI 財經新聞觀點區塊
+            st.markdown("### 🤖 AI 財經新聞綜合觀點")
+            st.info(f"**Gemini 洞察：** {ai_reason}")
                 
             # 畫 K 線圖
             plot_df = df.tail(90)
@@ -151,39 +180,30 @@ if st.button(f"🚀 啟動 {ticker} 即時訓練與預測", type="primary"):
             fig_imp.update_layout(title=f'{ticker} 專屬 XGBoost 特徵重要性分析', xaxis_title='重要性權重', yaxis_title='特徵名稱', template='plotly_white', height=400)
             st.plotly_chart(fig_imp, use_container_width=True)
 
-            # === [G] 歷史回測模組 (近半年/約 126 個交易日) ===
+            # --- 歷史回測模組 ---
             st.markdown("---")
             st.markdown("### 📊 AI 策略 vs 單純持有：近半年歷史回測")
             
             backtest_days = 126
-            if len(train_df) > backtest_days * 1.5:  # 確保有足夠資料切分
-                # 1. 嚴格切分資料：前段訓練，後段考試 (完全模擬真實情況)
+            if len(train_df) > backtest_days * 1.5:
                 bt_train = train_df.iloc[:-backtest_days]
                 bt_test = train_df.iloc[-backtest_days:].copy()
                 
-                # 2. 訓練回測專用模型
                 bt_model = XGBClassifier(n_estimators=100, learning_rate=0.05, max_depth=4, random_state=42)
                 bt_model.fit(bt_train[features], bt_train['Target'])
                 
-                # 3. 預測近半年的每一天
                 bt_test['Prediction'] = bt_model.predict(bt_test[features])
-                
-                # 4. 計算每日報酬率
                 bt_test['Daily_Return'] = bt_test['Close'].pct_change()
                 bt_test['Daily_Return'].fillna(0, inplace=True)
                 
-                # AI 策略報酬：昨天模型叫我買 (預測1)，我今天才吃得到漲跌幅。昨天叫我空手 (預測0)，今天報酬為 0。
                 bt_test['Strategy_Return'] = bt_test['Prediction'].shift(1).fillna(0) * bt_test['Daily_Return']
                 
-                # 5. 計算累積報酬率 (Cumulative Return)
                 bt_test['Cum_Market'] = (1 + bt_test['Daily_Return']).cumprod()
                 bt_test['Cum_Strategy'] = (1 + bt_test['Strategy_Return']).cumprod()
                 
-                # 6. 算出最終的投資回報率 (ROI)
                 market_roi = (bt_test['Cum_Market'].iloc[-1] - 1) * 100
                 strategy_roi = (bt_test['Cum_Strategy'].iloc[-1] - 1) * 100
                 
-                # 顯示回測結果數據
                 col3, col4 = st.columns(2)
                 with col3:
                     st.metric(label="📈 AI 策略累積報酬 (近半年)", value=f"{strategy_roi:.2f}%", 
@@ -191,7 +211,6 @@ if st.button(f"🚀 啟動 {ticker} 即時訓練與預測", type="primary"):
                 with col4:
                     st.metric(label="📉 單純買進持有 (Buy & Hold)", value=f"{market_roi:.2f}%")
                 
-                # 繪製回測累積報酬走勢圖
                 fig_bt = go.Figure()
                 fig_bt.add_trace(go.Scatter(x=bt_test['Date'], y=bt_test['Cum_Strategy'], 
                                             line=dict(color='red', width=2.5), name='AI 交易策略'))
@@ -203,7 +222,6 @@ if st.button(f"🚀 啟動 {ticker} 即時訓練與預測", type="primary"):
                                      template='plotly_white', height=450, hovermode='x unified')
                 st.plotly_chart(fig_bt, use_container_width=True)
                 
-                # 解釋策略邏輯
                 st.caption("ℹ️ **回測邏輯說明**：系統保留最近半年數據作為盲測。當 AI 預測隔日上漲時，持有部位；預測下跌時，空手觀望。此計算已透過時間平移 (Shift) 嚴格排除未來函數，確保驗證之學術嚴謹性。")
             else:
                 st.info("歷史資料不足以進行嚴謹的半年期回測。")
