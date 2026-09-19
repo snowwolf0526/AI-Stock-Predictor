@@ -2,6 +2,7 @@ streamlit
 yfinance
 pandas
 pandas-ta
+scikit-learn
 xgboost
 feedparser
 snownlp
