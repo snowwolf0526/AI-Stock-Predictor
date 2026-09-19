@@ -150,6 +150,63 @@ if st.button(f"🚀 啟動 {ticker} 即時訓練與預測", type="primary"):
             fig_imp = go.Figure(go.Bar(x=importance_df['重要性'], y=importance_df['特徵'], orientation='h', marker=dict(color='teal')))
             fig_imp.update_layout(title=f'{ticker} 專屬 XGBoost 特徵重要性分析', xaxis_title='重要性權重', yaxis_title='特徵名稱', template='plotly_white', height=400)
             st.plotly_chart(fig_imp, use_container_width=True)
+
+            # === [G] 歷史回測模組 (近半年/約 126 個交易日) ===
+            st.markdown("---")
+            st.markdown("### 📊 AI 策略 vs 單純持有：近半年歷史回測")
             
+            backtest_days = 126
+            if len(train_df) > backtest_days * 1.5:  # 確保有足夠資料切分
+                # 1. 嚴格切分資料：前段訓練，後段考試 (完全模擬真實情況)
+                bt_train = train_df.iloc[:-backtest_days]
+                bt_test = train_df.iloc[-backtest_days:].copy()
+                
+                # 2. 訓練回測專用模型
+                bt_model = XGBClassifier(n_estimators=100, learning_rate=0.05, max_depth=4, random_state=42)
+                bt_model.fit(bt_train[features], bt_train['Target'])
+                
+                # 3. 預測近半年的每一天
+                bt_test['Prediction'] = bt_model.predict(bt_test[features])
+                
+                # 4. 計算每日報酬率
+                bt_test['Daily_Return'] = bt_test['Close'].pct_change()
+                bt_test['Daily_Return'].fillna(0, inplace=True)
+                
+                # AI 策略報酬：昨天模型叫我買 (預測1)，我今天才吃得到漲跌幅。昨天叫我空手 (預測0)，今天報酬為 0。
+                bt_test['Strategy_Return'] = bt_test['Prediction'].shift(1).fillna(0) * bt_test['Daily_Return']
+                
+                # 5. 計算累積報酬率 (Cumulative Return)
+                bt_test['Cum_Market'] = (1 + bt_test['Daily_Return']).cumprod()
+                bt_test['Cum_Strategy'] = (1 + bt_test['Strategy_Return']).cumprod()
+                
+                # 6. 算出最終的投資回報率 (ROI)
+                market_roi = (bt_test['Cum_Market'].iloc[-1] - 1) * 100
+                strategy_roi = (bt_test['Cum_Strategy'].iloc[-1] - 1) * 100
+                
+                # 顯示回測結果數據
+                col3, col4 = st.columns(2)
+                with col3:
+                    st.metric(label="📈 AI 策略累積報酬 (近半年)", value=f"{strategy_roi:.2f}%", 
+                              delta=f"勝過單純持有 {strategy_roi - market_roi:.2f}%" if strategy_roi > market_roi else f"落後單純持有 {strategy_roi - market_roi:.2f}%")
+                with col4:
+                    st.metric(label="📉 單純買進持有 (Buy & Hold)", value=f"{market_roi:.2f}%")
+                
+                # 繪製回測累積報酬走勢圖
+                fig_bt = go.Figure()
+                fig_bt.add_trace(go.Scatter(x=bt_test['Date'], y=bt_test['Cum_Strategy'], 
+                                            line=dict(color='red', width=2.5), name='AI 交易策略'))
+                fig_bt.add_trace(go.Scatter(x=bt_test['Date'], y=bt_test['Cum_Market'], 
+                                            line=dict(color='gray', width=1.5, dash='dash'), name='單純買進持有'))
+                
+                fig_bt.update_layout(title=f'{ticker} 近半年 AI 策略與單純持有之績效對決',
+                                     yaxis_title='累積資產倍數 (1.0 = 本金)', xaxis_title='日期',
+                                     template='plotly_white', height=450, hovermode='x unified')
+                st.plotly_chart(fig_bt, use_container_width=True)
+                
+                # 解釋策略邏輯
+                st.caption("ℹ️ **回測邏輯說明**：系統保留最近半年數據作為盲測。當 AI 預測隔日上漲時，持有部位；預測下跌時，空手觀望。此計算已透過時間平移 (Shift) 嚴格排除未來函數，確保驗證之學術嚴謹性。")
+            else:
+                st.info("歷史資料不足以進行嚴謹的半年期回測。")
+                
         except Exception as e:
             st.error(f"發生系統錯誤，可能為輸入代號無效或 API 連線異常。錯誤細節：{e}")
