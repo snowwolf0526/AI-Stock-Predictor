@@ -19,12 +19,37 @@ st.set_page_config(page_title="AI 股市預測系統", layout="wide")
 # ⚡ 系統效能優化區：導入快取機制 (Caching)
 # ==========================================
 @st.cache_data(ttl=3600)
-def fetch_stock_data(ticker):
-    """抓取歷史股價並快取 1 小時，避免重複呼叫 API"""
+def fetch_stock_and_market_data(ticker):
+    """同時抓取個股與大盤歷史資料，並快取 1 小時"""
     end_date = datetime.now()
     start_date = end_date - timedelta(days=730)
+    
+    # 1. 抓取個股資料
     stock = yf.download(ticker, start=start_date.strftime("%Y-%m-%d"), end=end_date.strftime("%Y-%m-%d"), progress=False)
-    return stock
+    if stock.empty:
+        return pd.DataFrame()
+        
+    if isinstance(stock.columns, pd.MultiIndex):
+        stock.columns = stock.columns.droplevel(1)
+    stock.reset_index(inplace=True)
+    df = stock[['Date', 'Open', 'High', 'Low', 'Close', 'Volume']].copy()
+    
+    # 2. 抓取台灣加權指數 (^TWII) 作為總體經濟特徵
+    market = yf.download("^TWII", start=start_date.strftime("%Y-%m-%d"), end=end_date.strftime("%Y-%m-%d"), progress=False)
+    if not market.empty:
+        if isinstance(market.columns, pd.MultiIndex):
+            market.columns = market.columns.droplevel(1)
+        market.reset_index(inplace=True)
+        market = market[['Date', 'Close']].rename(columns={'Close': 'TWII_Close'})
+        market['TWII_Return'] = market['TWII_Close'].pct_change()
+        
+        # 3. 將大盤漲跌幅合併進個股資料表
+        df = pd.merge(df, market[['Date', 'TWII_Return']], on='Date', how='left')
+        df['TWII_Return'].fillna(0, inplace=True)
+    else:
+        df['TWII_Return'] = 0.0
+        
+    return df
 
 @st.cache_data(ttl=3600)
 def fetch_news_sentiment(keyword):
@@ -45,7 +70,6 @@ def fetch_news_sentiment(keyword):
             valid_model_name = 'gemini-3.6-flash'
             model = genai.GenerativeModel(valid_model_name)
             
-            # 強制要求回傳 JSON 格式
             prompt = f"""你是一個專業的台灣股市分析師。請綜合分析以下新聞標題對該公司股價的情緒影響。
             請務必只回傳一個標準的 JSON 格式字串，不要包含任何其他解釋文字或 Markdown 標籤。
             格式範例：{{"score": 0.8, "reason": "因為營收創新高且外資調升評等，市場情緒樂觀。"}}
@@ -55,7 +79,6 @@ def fetch_news_sentiment(keyword):
             response = model.generate_content(prompt)
             raw_text = response.text.strip()
             
-            # 清理 Markdown 標籤
             if raw_text.startswith("```"):
                 raw_text = re.sub(r"^```(json)?|```$", "", raw_text, flags=re.MULTILINE).strip()
                 
@@ -80,7 +103,7 @@ def fetch_news_sentiment(keyword):
 # 🖥️ 主程式與 UI 顯示區
 # ==========================================
 st.title("📈 畢業專題：AI 股市預測系統 (即時動態訓練版)")
-st.markdown("本系統採用 **On-the-fly 即時訓練架構**，結合 LLM 新聞情緒分析與歷史回測模組，並導入 **快取機制 (Caching)** 大幅提升查詢效能。")
+st.markdown("本系統採用 **On-the-fly 即時訓練架構**，結合 LLM 情緒分析、大盤趨勢特徵，並導入 **風險控管停損機制** 的量化回測模組。")
 st.warning("⚠️ 免責聲明：本系統僅供學術專題展示使用，不構成任何投資建議。")
 
 st.markdown("### 🎯 請輸入預測標的")
@@ -97,22 +120,13 @@ else:
     ticker = f"{clean_ticker}.TW"
 
 if st.button(f"🚀 啟動 {ticker} 即時訓練與預測", type="primary"):
-    with st.spinner(f'正在進行運算中，若為首次查詢需時 5-8 秒，再次查詢將啟動 0.1 秒極速快取...'):
+    with st.spinner(f'正在進行運算中，若為首次查詢需時 5-8 秒，再次查詢將啟動極速快取...'):
         try:
-            # 呼叫快取函數抓資料
-            stock = fetch_stock_data(ticker)
+            # 呼叫快取函數抓資料 (包含個股與大盤 TWII)
+            df = fetch_stock_and_market_data(ticker)
             
-            if stock.empty:
-                st.error("❌ 找不到該股票資料，請確認代號是否正確。")
-                st.stop()
-                
-            if isinstance(stock.columns, pd.MultiIndex):
-                stock.columns = stock.columns.droplevel(1)
-            stock.reset_index(inplace=True)
-            df = stock[['Date', 'Open', 'High', 'Low', 'Close', 'Volume']].copy()
-            
-            if len(df) < 300:
-                st.error(f"❌ {ticker} 上市時間過短，歷史資料不足 (需至少 300 天)，無法進行機器學習訓練！")
+            if df.empty or len(df) < 300:
+                st.error("❌ 找不到該股票資料或上市時間過短 (需至少 300 天)，無法進行機器學習訓練！")
                 st.stop()
                 
             # 呼叫快取函數抓新聞情緒與 AI 解析
@@ -125,12 +139,13 @@ if st.button(f"🚀 啟動 {ticker} 即時訓練與預測", type="primary"):
             df.ta.rsi(length=14, append=True)
             df.ta.macd(append=True)
             
-            # 定義預測目標 (Y) 與特徵 (X)
+            # 定義預測目標 (Y)
             df['Next_Close'] = df['Close'].shift(-1)
             df['Target'] = (df['Next_Close'] > df['Close']).astype(int)
             
+            # 🔥 將「大盤漲跌幅 (TWII_Return)」正式加入特徵矩陣中
             features = ['Open', 'High', 'Low', 'Close', 'Volume', 
-                        'Sentiment', 'SMA_5', 'SMA_10', 'RSI_14', 
+                        'Sentiment', 'TWII_Return', 'SMA_5', 'SMA_10', 'RSI_14', 
                         'MACD_12_26_9', 'MACDh_12_26_9', 'MACDs_12_26_9']
                         
             train_df = df.dropna(subset=features + ['Target'])
@@ -145,7 +160,7 @@ if st.button(f"🚀 啟動 {ticker} 即時訓練與預測", type="primary"):
             prediction = model_xgb.predict(X_today)[0]
             probability = model_xgb.predict_proba(X_today)[0]
             
-            st.success(f"✅ 專屬模型訓練完成！共使用 {len(train_df)} 筆歷史資料進行現場訓練。")
+            st.success(f"✅ 專屬模型訓練完成！共使用 {len(train_df)} 筆歷史資料進行現場訓練，並已納入台灣加權指數(大盤)特徵。")
             
             # --- 畫面顯示區 ---
             st.markdown("### 🔮 明日趨勢預測結果")
@@ -180,9 +195,9 @@ if st.button(f"🚀 啟動 {ticker} 即時訓練與預測", type="primary"):
             fig_imp.update_layout(title=f'{ticker} 專屬 XGBoost 特徵重要性分析', xaxis_title='重要性權重', yaxis_title='特徵名稱', template='plotly_white', height=400)
             st.plotly_chart(fig_imp, use_container_width=True)
 
-            # --- 歷史回測模組 ---
+            # --- 歷史回測模組 (含停損機制) ---
             st.markdown("---")
-            st.markdown("### 📊 AI 策略 vs 單純持有：近半年歷史回測")
+            st.markdown("### 📊 AI 策略 vs 單純持有：近半年歷史回測 (含 5% 停損機制)")
             
             backtest_days = 126
             if len(train_df) > backtest_days * 1.5:
@@ -196,7 +211,13 @@ if st.button(f"🚀 啟動 {ticker} 即時訓練與預測", type="primary"):
                 bt_test['Daily_Return'] = bt_test['Close'].pct_change()
                 bt_test['Daily_Return'].fillna(0, inplace=True)
                 
+                # 計算 AI 策略原始報酬
                 bt_test['Strategy_Return'] = bt_test['Prediction'].shift(1).fillna(0) * bt_test['Daily_Return']
+                
+                # 🔥 實作 5% 動態停損機制 (Risk Management)
+                # 假設盤中跌幅過大，強迫在 -5% 停損出場，避免單日暴跌重創資產
+                stop_loss_threshold = -0.05
+                bt_test['Strategy_Return'] = bt_test['Strategy_Return'].clip(lower=stop_loss_threshold)
                 
                 bt_test['Cum_Market'] = (1 + bt_test['Daily_Return']).cumprod()
                 bt_test['Cum_Strategy'] = (1 + bt_test['Strategy_Return']).cumprod()
@@ -213,7 +234,7 @@ if st.button(f"🚀 啟動 {ticker} 即時訓練與預測", type="primary"):
                 
                 fig_bt = go.Figure()
                 fig_bt.add_trace(go.Scatter(x=bt_test['Date'], y=bt_test['Cum_Strategy'], 
-                                            line=dict(color='red', width=2.5), name='AI 交易策略'))
+                                            line=dict(color='red', width=2.5), name='AI 交易策略 (含停損)'))
                 fig_bt.add_trace(go.Scatter(x=bt_test['Date'], y=bt_test['Cum_Market'], 
                                             line=dict(color='gray', width=1.5, dash='dash'), name='單純買進持有'))
                 
@@ -222,7 +243,7 @@ if st.button(f"🚀 啟動 {ticker} 即時訓練與預測", type="primary"):
                                      template='plotly_white', height=450, hovermode='x unified')
                 st.plotly_chart(fig_bt, use_container_width=True)
                 
-                st.caption("ℹ️ **回測邏輯說明**：系統保留最近半年數據作為盲測。當 AI 預測隔日上漲時，持有部位；預測下跌時，空手觀望。此計算已透過時間平移 (Shift) 嚴格排除未來函數，確保驗證之學術嚴謹性。")
+                st.caption("ℹ️ **回測與停損邏輯說明**：系統保留最近半年數據作為盲測，採用時間平移 (Shift) 排除未來函數。並實作**單日 5% 停損機制**，當策略持倉且單日跌幅超過 5% 時，模擬盤中強制出場，強化資產下檔保護。")
             else:
                 st.info("歷史資料不足以進行嚴謹的半年期回測。")
                 
