@@ -3,6 +3,7 @@ import yfinance as yf
 import pandas as pd
 import pandas_ta as ta
 from xgboost import XGBClassifier
+from sklearn.model_selection import RandomizedSearchCV
 import feedparser
 from snownlp import SnowNLP
 from datetime import datetime, timedelta
@@ -71,14 +72,13 @@ def fetch_news_sentiment(keyword):
             model = genai.GenerativeModel(valid_model_name)
             
             prompt = f"""你是一個專業的台灣股市分析師。請綜合分析以下新聞標題對該公司股價的情緒影響。
-            請務必只回傳一個標準的 JSON 格式字串，不要包含任何其他解釋文字或 Markdown 標籤。
-            格式範例：{{"score": 0.8, "reason": "因為營收創新高且外資調升評等，市場情緒樂觀。"}}
-            score 必須是 0.0 到 1.0 的浮點數（0.0為極度看跌，1.0為極度看漲，0.5為中立）。
+            請務必只回傳一個標準的 JSON 格式字串，不要包含任何其他解釋文字。
+            格式範例：{{"score": 0.8, "reason": "因為營收創新高，市場情緒樂觀。"}}
+            score 必須是 0.0 到 1.0 的浮點數。
             新聞標題：{news_titles}"""
             
             response = model.generate_content(prompt)
             raw_text = response.text.strip()
-            
             if raw_text.startswith("```"):
                 raw_text = re.sub(r"^```(json)?|```$", "", raw_text, flags=re.MULTILINE).strip()
                 
@@ -99,11 +99,33 @@ def fetch_news_sentiment(keyword):
                 
     return avg_sentiment, ai_reason
 
+def generate_ai_report(ticker, prediction, confidence, ai_reason, top_features, strategy_roi, market_roi):
+    """呼叫 Gemini 進行多模態/綜合數據的投顧報告生成"""
+    try:
+        import google.generativeai as genai
+        model = genai.GenerativeModel('gemini-3.6-flash')
+        prompt = f"""你是一位頂級的量化交易首席分析師。請根據以下 AI 模型運算結果，為投資人撰寫一篇 150-200 字的專業綜合診斷報告。
+        語氣要客觀、專業、具備說服力。請不要提及「這只是模擬」等免責廢話，直接給出分析結論。
+        
+        【系統數據分析結果】
+        1. 分析標的：{ticker}
+        2. 模型預測明日走勢：{'上漲' if prediction == 1 else '下跌'} (模型信心水準：{confidence:.1f}%)
+        3. 消息面解讀：{ai_reason}
+        4. 決策最關鍵特徵 (技術/大盤/籌碼)：{', '.join(top_features)}
+        5. 近半年量化回測報酬率：AI 策略 {strategy_roi:.2f}% vs 單純持有 {market_roi:.2f}%
+        
+        請統整以上數據，給出一段清晰的投資與風險控管建議。"""
+        
+        response = model.generate_content(prompt)
+        return response.text.strip()
+    except Exception as e:
+        return "⚠️ 首席分析師 AI 暫時離線，無法生成總結報告。"
+
 # ==========================================
 # 🖥️ 主程式與 UI 顯示區
 # ==========================================
-st.title("📈 畢業專題：AI 股市預測系統 (即時動態訓練版)")
-st.markdown("本系統採用 **On-the-fly 即時訓練架構**，結合 LLM 情緒分析、大盤趨勢特徵，並導入 **風險控管停損機制** 的量化回測模組。")
+st.title("📈 畢業專題：AI 股市預測系統 (AutoML 終極版)")
+st.markdown("本系統整合了 **On-the-fly AutoML 超參數調優**、**Gemini 首席分析師**、**籌碼動能特徵 (OBV/MFI)** 與 **風險控管回測模組**。")
 st.warning("⚠️ 免責聲明：本系統僅供學術專題展示使用，不構成任何投資建議。")
 
 st.markdown("### 🎯 請輸入預測標的")
@@ -119,50 +141,55 @@ if clean_ticker.endswith(".TW") or clean_ticker.endswith(".TWO"):
 else:
     ticker = f"{clean_ticker}.TW"
 
-if st.button(f"🚀 啟動 {ticker} 即時訓練與預測", type="primary"):
-    with st.spinner(f'正在進行運算中，若為首次查詢需時 5-8 秒，再次查詢將啟動極速快取...'):
+if st.button(f"🚀 啟動 {ticker} 深度訓練與預測", type="primary"):
+    with st.spinner(f'系統正在進行 AutoML 動態尋優與多模態分析，請稍候約 10 秒...'):
         try:
-            # 呼叫快取函數抓資料 (包含個股與大盤 TWII)
+            # 1. 抓取資料
             df = fetch_stock_and_market_data(ticker)
-            
             if df.empty or len(df) < 300:
-                st.error("❌ 找不到該股票資料或上市時間過短 (需至少 300 天)，無法進行機器學習訓練！")
+                st.error("❌ 歷史資料不足 (需至少 300 天)，無法進行訓練！")
                 st.stop()
                 
-            # 呼叫快取函數抓新聞情緒與 AI 解析
+            # 2. 新聞情緒
             avg_sentiment, ai_reason = fetch_news_sentiment(keyword)
             df['Sentiment'] = avg_sentiment  
             
-            # 計算技術指標
+            # 3. 🎯 進階特徵工程 (加入籌碼面動能 OBV, MFI)
             df.ta.sma(length=5, append=True)
             df.ta.sma(length=10, append=True)
             df.ta.rsi(length=14, append=True)
             df.ta.macd(append=True)
+            df.ta.obv(append=True)     # 能量潮 (聰明錢籌碼指標)
+            df.ta.mfi(length=14, append=True) # 資金流量指標
             
-            # 定義預測目標 (Y)
             df['Next_Close'] = df['Close'].shift(-1)
             df['Target'] = (df['Next_Close'] > df['Close']).astype(int)
             
-            # 🔥 將「大盤漲跌幅 (TWII_Return)」正式加入特徵矩陣中
-            features = ['Open', 'High', 'Low', 'Close', 'Volume', 
-                        'Sentiment', 'TWII_Return', 'SMA_5', 'SMA_10', 'RSI_14', 
-                        'MACD_12_26_9', 'MACDh_12_26_9', 'MACDs_12_26_9']
+            features = ['Open', 'High', 'Low', 'Close', 'Volume', 'Sentiment', 'TWII_Return', 
+                        'SMA_5', 'SMA_10', 'RSI_14', 'MACD_12_26_9', 'OBV', 'MFI_14']
                         
             train_df = df.dropna(subset=features + ['Target'])
             latest_data = df.iloc[-1:]
             X_today = latest_data[features]
             
-            # 即時動態訓練 (On-the-fly)
-            model_xgb = XGBClassifier(n_estimators=100, learning_rate=0.05, max_depth=4, random_state=42)
-            model_xgb.fit(train_df[features], train_df['Target'])
+            # 4. 🧠 AutoML 動態超參數調優
+            param_grid = {
+                'max_depth': [3, 4, 5],
+                'learning_rate': [0.01, 0.05, 0.1],
+                'n_estimators': [50, 100, 150]
+            }
+            base_model = XGBClassifier(random_state=42)
+            rs = RandomizedSearchCV(base_model, param_distributions=param_grid, n_iter=5, cv=3, random_state=42)
+            rs.fit(train_df[features], train_df['Target'])
+            model_xgb = rs.best_estimator_
+            best_params = rs.best_params_
             
-            # 進行預測
             prediction = model_xgb.predict(X_today)[0]
             probability = model_xgb.predict_proba(X_today)[0]
             
-            st.success(f"✅ 專屬模型訓練完成！共使用 {len(train_df)} 筆歷史資料進行現場訓練，並已納入台灣加權指數(大盤)特徵。")
+            st.success(f"✅ AutoML 訓練完成！系統已為 {ticker} 找到最佳模型參數：{best_params}。")
             
-            # --- 畫面顯示區 ---
+            # 5. 畫面顯示區
             st.markdown("### 🔮 明日趨勢預測結果")
             col1, col2 = st.columns(2)
             with col1:
@@ -174,11 +201,43 @@ if st.button(f"🚀 啟動 {ticker} 即時訓練與預測", type="primary"):
                 confidence = probability[prediction] * 100
                 st.metric(label="模型信心水準", value=f"{confidence:.1f}%")
             
-            # 🤖 新增 AI 財經新聞觀點區塊
-            st.markdown("### 🤖 AI 財經新聞綜合觀點")
-            st.info(f"**Gemini 洞察：** {ai_reason}")
+            # 歷史回測模組 (先算出來給 AI 報告用)
+            backtest_days = 126
+            strategy_roi, market_roi = 0, 0
+            bt_test = pd.DataFrame()
+            if len(train_df) > backtest_days * 1.5:
+                bt_train = train_df.iloc[:-backtest_days]
+                bt_test = train_df.iloc[-backtest_days:].copy()
                 
-            # 畫 K 線圖
+                # 回測使用相同的最佳參數
+                bt_model = XGBClassifier(**best_params, random_state=42)
+                bt_model.fit(bt_train[features], bt_train['Target'])
+                
+                bt_test['Prediction'] = bt_model.predict(bt_test[features])
+                bt_test['Daily_Return'] = bt_test['Close'].pct_change()
+                bt_test['Daily_Return'].fillna(0, inplace=True)
+                
+                bt_test['Strategy_Return'] = bt_test['Prediction'].shift(1).fillna(0) * bt_test['Daily_Return']
+                bt_test['Strategy_Return'] = bt_test['Strategy_Return'].clip(lower=-0.05) # 5%停損
+                
+                bt_test['Cum_Market'] = (1 + bt_test['Daily_Return']).cumprod()
+                bt_test['Cum_Strategy'] = (1 + bt_test['Strategy_Return']).cumprod()
+                
+                market_roi = (bt_test['Cum_Market'].iloc[-1] - 1) * 100
+                strategy_roi = (bt_test['Cum_Strategy'].iloc[-1] - 1) * 100
+
+            # 特徵重要性
+            importance_df = pd.DataFrame({'特徵': features, '重要性': model_xgb.feature_importances_}).sort_values(by='重要性', ascending=True)
+            top_3_features = importance_df['特徵'].iloc[-3:].tolist()
+
+            # 6. 🧠 首席 AI 投顧報告區
+            st.markdown("### 🤖 首席 AI 總體診斷報告")
+            with st.spinner("AI 正在綜整技術面、籌碼面與新聞情緒..."):
+                final_report = generate_ai_report(ticker, prediction, confidence, ai_reason, top_3_features, strategy_roi, market_roi)
+                st.info(final_report)
+                
+            # 畫 K 線圖與特徵重要性圖表
+            st.markdown("---")
             plot_df = df.tail(90)
             fig = go.Figure(data=[go.Candlestick(x=plot_df['Date'],
                             open=plot_df['Open'], high=plot_df['High'],
@@ -188,43 +247,14 @@ if st.button(f"🚀 啟動 {ticker} 即時訓練與預測", type="primary"):
             fig.update_layout(title=f'{ticker} 近 90 日走勢與均線', yaxis_title='股價 (TWD)', xaxis_title='日期', template='plotly_white', height=500)
             st.plotly_chart(fig, use_container_width=True)
             
-            # 特徵重要性圖表
-            st.markdown("### 🔍 模型決策關鍵 (特徵重要性)")
-            importance_df = pd.DataFrame({'特徵': features, '重要性': model_xgb.feature_importances_}).sort_values(by='重要性', ascending=True)
             fig_imp = go.Figure(go.Bar(x=importance_df['重要性'], y=importance_df['特徵'], orientation='h', marker=dict(color='teal')))
             fig_imp.update_layout(title=f'{ticker} 專屬 XGBoost 特徵重要性分析', xaxis_title='重要性權重', yaxis_title='特徵名稱', template='plotly_white', height=400)
             st.plotly_chart(fig_imp, use_container_width=True)
 
-            # --- 歷史回測模組 (含停損機制) ---
+            # 顯示回測結果
             st.markdown("---")
             st.markdown("### 📊 AI 策略 vs 單純持有：近半年歷史回測 (含 5% 停損機制)")
-            
-            backtest_days = 126
-            if len(train_df) > backtest_days * 1.5:
-                bt_train = train_df.iloc[:-backtest_days]
-                bt_test = train_df.iloc[-backtest_days:].copy()
-                
-                bt_model = XGBClassifier(n_estimators=100, learning_rate=0.05, max_depth=4, random_state=42)
-                bt_model.fit(bt_train[features], bt_train['Target'])
-                
-                bt_test['Prediction'] = bt_model.predict(bt_test[features])
-                bt_test['Daily_Return'] = bt_test['Close'].pct_change()
-                bt_test['Daily_Return'].fillna(0, inplace=True)
-                
-                # 計算 AI 策略原始報酬
-                bt_test['Strategy_Return'] = bt_test['Prediction'].shift(1).fillna(0) * bt_test['Daily_Return']
-                
-                # 🔥 實作 5% 動態停損機制 (Risk Management)
-                # 假設盤中跌幅過大，強迫在 -5% 停損出場，避免單日暴跌重創資產
-                stop_loss_threshold = -0.05
-                bt_test['Strategy_Return'] = bt_test['Strategy_Return'].clip(lower=stop_loss_threshold)
-                
-                bt_test['Cum_Market'] = (1 + bt_test['Daily_Return']).cumprod()
-                bt_test['Cum_Strategy'] = (1 + bt_test['Strategy_Return']).cumprod()
-                
-                market_roi = (bt_test['Cum_Market'].iloc[-1] - 1) * 100
-                strategy_roi = (bt_test['Cum_Strategy'].iloc[-1] - 1) * 100
-                
+            if not bt_test.empty:
                 col3, col4 = st.columns(2)
                 with col3:
                     st.metric(label="📈 AI 策略累積報酬 (近半年)", value=f"{strategy_roi:.2f}%", 
@@ -242,8 +272,6 @@ if st.button(f"🚀 啟動 {ticker} 即時訓練與預測", type="primary"):
                                      yaxis_title='累積資產倍數 (1.0 = 本金)', xaxis_title='日期',
                                      template='plotly_white', height=450, hovermode='x unified')
                 st.plotly_chart(fig_bt, use_container_width=True)
-                
-                st.caption("ℹ️ **回測與停損邏輯說明**：系統保留最近半年數據作為盲測，採用時間平移 (Shift) 排除未來函數。並實作**單日 5% 停損機制**，當策略持倉且單日跌幅超過 5% 時，模擬盤中強制出場，強化資產下檔保護。")
             else:
                 st.info("歷史資料不足以進行嚴謹的半年期回測。")
                 
