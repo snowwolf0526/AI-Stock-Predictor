@@ -1,10 +1,13 @@
+fastapi
+uvicorn
 streamlit
 yfinance
 pandas
 pandas-ta
-scikit-learn
 xgboost
+scikit-learn
 feedparser
 snownlp
 plotly
 google-generativeai
+python-dotenv
